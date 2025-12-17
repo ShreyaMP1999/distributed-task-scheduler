@@ -1,0 +1,56 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["5432:5432"]
+
+  api:
+    build: .
+    env_file: .env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+    ports: ["8000:8000"]
+
+  scheduler:
+    build: .
+    env_file: .env
+    command: python -m scheduler.scheduler
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+
+  worker_high:
+    build: .
+    env_file: .env
+    command: celery -A app.celery_app.celery worker -Q high -c 4 --loglevel=INFO
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+
+  worker_default:
+    build: .
+    env_file: .env
+    command: celery -A app.celery_app.celery worker -Q default -c 2 --loglevel=INFO
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+
+  worker_low:
+    build: .
+    env_file: .env
+    command: celery -A app.celery_app.celery worker -Q low -c 1 --loglevel=INFO
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+
+  worker_dlq:
+    build: .
+    env_file: .env
+    command: celery -A app.celery_app.celery worker -Q dlq -c 1 --loglevel=INFO
+    volumes: ["./:/code"]
+    depends_on: [redis, postgres]
+
