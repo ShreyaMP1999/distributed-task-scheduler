@@ -1,10 +1,10 @@
 import time
 from datetime import timedelta
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_
 
 from app.db import SessionLocal, engine, Base
-from app.models import Task, TaskStatus
+from app.models import Task, TaskStatus, DLQEvent
 from app.celery_app import celery
 from app.timing import now_utc, backoff_seconds
 
@@ -33,30 +33,26 @@ def sweep_stuck_tasks():
         stuck = db.execute(
             select(Task)
             .where(
-                and_(
-                    Task.status == TaskStatus.STARTED,
-                    Task.started_at.is_not(None),
-                    Task.started_at <= cutoff,
+                or_(
+                    and_(Task.status == TaskStatus.STARTED,
+                         Task.started_at.is_not(None), Task.started_at <= cutoff),
+                    and_(Task.status == TaskStatus.ENQUEUED, Task.updated_at <= cutoff),
                 )
             )
             .order_by(Task.started_at.asc())
             .limit(LIMIT)
+            .with_for_update(skip_locked=True)
         ).scalars().all()
 
         for t in stuck:
             t.attempts += 1
-            t.last_error = f"Stuck task detected (started_at={t.started_at.isoformat()})"
+            t.last_error = f"Stuck task detected (status={t.status.value})"
 
             if t.attempts > t.max_retries:
                 t.status = TaskStatus.DEAD
                 t.finished_at = now_utc()
-                db.commit()
-
-                celery.send_task(
-                    "app.tasks.dlq_handler",
-                    args=[t.id, "stuck_task_timeout", t.last_error, t.payload],
-                    queue="dlq",
-                )
+                db.add(DLQEvent(task_id=t.id, reason="stuck_task_timeout",
+                                error=t.last_error, payload=t.payload))
             else:
                 t.status = TaskStatus.FAILED
                 t.run_at = now_utc() + timedelta(seconds=backoff_seconds(t.attempts))
@@ -74,18 +70,22 @@ def dispatch_due_tasks():
             )
             .order_by(Task.priority.desc(), Task.run_at.asc())
             .limit(LIMIT)
+            .with_for_update(skip_locked=True)
         ).scalars().all()
 
         for t in due:
             q = queue_for_priority(t.priority)
 
+            # Keep the row locked through publication. A worker claiming this row
+            # waits until ENQUEUED commits; another scheduler skips the lock.
+            t.status = TaskStatus.ENQUEUED
+            t.updated_at = now_utc()
+            db.flush()
             celery.send_task(
                 "app.tasks.run_task",
-                args=[t.id],
+                args=[t.id, t.attempts],
                 queue=q,
             )
-
-            t.status = TaskStatus.ENQUEUED
 
         db.commit()
 

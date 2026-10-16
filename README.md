@@ -13,18 +13,18 @@ This project demonstrates core distributed systems reliability patterns:
 ARCHITECTURE OVERVIEW
 Components
 -FastAPI (api): Create tasks + check status
--PostgreSQL (postgres): Source of truth for task state + DLQ audit events
+-PostgreSQL (postgres): Source of truth for task state + DLQ audit events (saved together in one transaction)
 -Redis (redis): Message broker for Celery queues
--Scheduler (scheduler): Polls DB for due tasks → enqueues to Redis + sweeps stuck tasks
+-Scheduler (scheduler): Polls DB for due tasks → enqueues to Redis + sweeps stuck queued/running tasks
 -Celery Workers
     worker_high: executes priority 8–10 tasks
     worker_default: executes priority 4–7 tasks
     worker_low: executes priority 1–3 tasks
-    worker_dlq: consumes DLQ queue and writes DLQ audit events
+    worker_dlq: consumes legacy DLQ messages; new terminal failures write audit events directly to PostgreSQL
 Task Lifecycle
 PENDING → ENQUEUED → STARTED → SUCCEEDED
 failures: FAILED → (retry) → SUCCEEDED
-exhausted retries: DEAD → DLQ
+exhausted retries: DEAD + DLQ audit event
 
 PROJECT STRUCTURE
 distributed-task-scheduler/
@@ -130,7 +130,7 @@ Then simulate worker crash:
     docker compose kill worker_default
     docker compose up -d worker_default
 After STUCK_AFTER_SEC (default: 180s), scheduler will detect it as stuck and:
-retry it if retries remain otherwise mark DEAD and push to DLQ
+retry it if retries remain otherwise mark DEAD and save a DLQ audit event
 
 How to Inspect DLQ Events (Postgres)
 
@@ -153,3 +153,36 @@ Follow all logs
     docker compose logs -f
 Check if all services are up
     docker compose ps
+
+
+RELIABILITY AND TESTS
+
+Workers load task handlers through the Celery application. Retry backoff starts
+when an attempt fails (2, 4, 8, ... seconds, capped at 60), rather than when the
+scheduler publishes the retry. `max_retries` counts retries after the first attempt.
+`run_at` must include a timezone (`Z` or an explicit UTC offset); task names must
+contain 1–120 characters.
+
+PostgreSQL row locks let multiple schedulers claim separate batches. Dispatch
+holds the lock through publication and commit, and workers lock the row before
+checking its state. Each message includes the failure count for its attempt, so
+duplicate or delayed messages cannot claim a newer retry. The sweeper recovers
+both ENQUEUED and STARTED tasks after 180 seconds and invalidates the old attempt.
+Stale workers cannot overwrite the replacement attempt's status. Terminal failures
+save DEAD and the DLQ audit event together, even if Redis is unavailable.
+
+Execution is still at least once: timed-out work can continue outside the database.
+Real task handlers must make external side effects idempotent. A queue backlog
+longer than the timeout also consumes the retry budget. Deploy scheduler and worker
+changes together; messages from the old scheduler lack the attempt argument and
+can only claim an initial attempt (stale queued retries recover through the sweeper).
+
+Run regression tests after installing `requirements.txt`:
+
+    python -m unittest discover -v
+
+The default suite uses temporary SQLite databases and mocks broker publication.
+To also verify concurrent PostgreSQL row locks, point `TEST_DATABASE_URL` at a test
+database whose user can create schemas. Each test creates and removes its own schema:
+
+    TEST_DATABASE_URL=postgresql+psycopg2://user:password@localhost/test_db python -m unittest discover -v
