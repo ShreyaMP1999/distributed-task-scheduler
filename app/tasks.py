@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import timedelta
 import time
 
 from celery import shared_task
@@ -7,9 +7,7 @@ from sqlalchemy import select
 from app.db import SessionLocal
 from app.models import Task, TaskStatus, DLQEvent
 from app.celery_app import celery
-
-def _now():
-    return datetime.now(timezone.utc)
+from app.timing import now_utc, backoff_seconds
 
 @shared_task(name="app.tasks.dlq_handler")
 def dlq_handler(task_id: int, reason: str, error: str | None, payload: dict):
@@ -29,7 +27,7 @@ def run_task(self, task_id: int):
 
         payload = dict(task.payload)
         task.status = TaskStatus.STARTED
-        task.started_at = _now()
+        task.started_at = now_utc()
         db.commit()
 
     try:
@@ -48,7 +46,7 @@ def run_task(self, task_id: int):
         with SessionLocal() as db:
             t2 = db.execute(select(Task).where(Task.id == task_id)).scalar_one()
             t2.status = TaskStatus.SUCCEEDED
-            t2.finished_at = _now()
+            t2.finished_at = now_utc()
             t2.last_error = None
             db.commit()
 
@@ -65,7 +63,7 @@ def run_task(self, task_id: int):
             # exceeded retry budget → DEAD + send to DLQ
             if t2.attempts > t2.max_retries:
                 t2.status = TaskStatus.DEAD
-                t2.finished_at = _now()
+                t2.finished_at = now_utc()
                 db.commit()
 
                 celery.send_task(
@@ -76,6 +74,7 @@ def run_task(self, task_id: int):
             else:
                 # scheduler will retry later with backoff
                 t2.status = TaskStatus.FAILED
+                t2.run_at = now_utc() + timedelta(seconds=backoff_seconds(t2.attempts))
                 db.commit()
 
         raise

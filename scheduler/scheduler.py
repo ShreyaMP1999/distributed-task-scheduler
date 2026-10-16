@@ -1,11 +1,12 @@
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from sqlalchemy import select, and_
 
 from app.db import SessionLocal, engine, Base
 from app.models import Task, TaskStatus
 from app.celery_app import celery
+from app.timing import now_utc, backoff_seconds
 
 from app.wait_for_db import wait_for_db
 # ✅ Wait for Postgres to be ready before proceeding
@@ -14,18 +15,12 @@ POLL_INTERVAL_SEC = 1
 STUCK_AFTER_SEC = 180   # 3 minutes
 LIMIT = 200
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
 def queue_for_priority(p: int) -> str:
     if p >= 8:
         return "high"
     if p >= 4:
         return "default"
     return "low"
-
-def backoff_seconds(attempts: int, base: int = 2, cap: int = 60) -> int:
-    return min(cap, base * (2 ** max(0, attempts - 1)))
 
 def ensure_tables_exist():
     # Creates tasks + dlq_events if they don't exist yet
@@ -91,9 +86,6 @@ def dispatch_due_tasks():
             )
 
             t.status = TaskStatus.ENQUEUED
-
-            if t.attempts > 0 and t.attempts <= t.max_retries:
-                t.run_at = now_utc() + timedelta(seconds=backoff_seconds(t.attempts))
 
         db.commit()
 
