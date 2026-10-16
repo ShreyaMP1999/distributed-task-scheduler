@@ -1,188 +1,243 @@
-Distributed Task Scheduler (Fault-Tolerant) 🚀
+# Distributed Task Scheduler
 
-A simple, clean distributed task scheduling system built with: Python + FastAPI + Celery + Redis + PostgreSQL + Docker Compose
+A distributed task scheduler built with **FastAPI, Celery, Redis, PostgreSQL, and Docker Compose**. Submit tasks through an HTTP API, schedule them for a specific time, and track their execution across priority queues.
 
-This project demonstrates core distributed systems reliability patterns:
--Scheduling tasks to run at a specific time (run_at)
--Distributed execution via Celery workers
--Priority queues (high, default, low)
--Automatic retries with backoff
--Dead Letter Queue (DLQ) when retry budget is exhausted
--Stuck-task sweeper to recover from worker crashes / hung tasks
+This project demonstrates retries with exponential backoff, recovery after worker failures, and durable dead-letter audit records. The task handler currently echoes its payload and provides optional failure and sleep hooks for demonstrations.
 
-ARCHITECTURE OVERVIEW
-Components
--FastAPI (api): Create tasks + check status
--PostgreSQL (postgres): Source of truth for task state + DLQ audit events (saved together in one transaction)
--Redis (redis): Message broker for Celery queues
--Scheduler (scheduler): Polls DB for due tasks → enqueues to Redis + sweeps stuck queued/running tasks
--Celery Workers
-    worker_high: executes priority 8–10 tasks
-    worker_default: executes priority 4–7 tasks
-    worker_low: executes priority 1–3 tasks
-    worker_dlq: consumes legacy DLQ messages; new terminal failures write audit events directly to PostgreSQL
-Task Lifecycle
+## Architecture
+
+```text
+Client → FastAPI → PostgreSQL ← Scheduler → Redis → Celery workers
+                       ↑                               │
+                       └──── task status + DLQ audit ───┘
+```
+
+| Component | Responsibility |
+| --- | --- |
+| `api` | Create tasks and retrieve their current status. |
+| `postgres` | Store task state and dead-letter audit events. |
+| `redis` | Broker Celery messages and store Celery results. |
+| `scheduler` | Poll for due tasks every second, dispatch them, and recover stuck tasks. |
+| `worker_high` | Process priorities 8–10 with concurrency 4. |
+| `worker_default` | Process priorities 4–7 with concurrency 2. |
+| `worker_low` | Process priorities 1–3 with concurrency 1. |
+| `worker_dlq` | Consume legacy DLQ messages. New terminal failures save audit records directly in PostgreSQL. |
+
+Priority selects a queue; it does not guarantee execution order across workers or preempt running tasks.
+
+## Quick start
+
+Install Docker with Docker Compose and ensure Docker is running. Local Python is only needed if you want to run the regression tests outside Docker.
+
+### 1. Clone the repository
+
+```sh
+git clone https://github.com/ShreyaMP1999/distributed-task-scheduler.git
+cd distributed-task-scheduler
+```
+
+### 2. Configure the environment
+
+Create or update `.env` in the repository root with these local development values:
+
+```dotenv
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=tasks
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/tasks
+REDIS_URL=redis://redis:6379/0
+```
+
+The hostnames `postgres` and `redis` refer to services inside Compose. When running Python directly on your host, use `localhost` in the corresponding URLs instead. The Python configuration reads environment variables; it does not automatically load `.env` outside Compose.
+
+### 3. Start the services
+
+```sh
+docker compose up --build
+```
+
+The API and scheduler wait for PostgreSQL and create the tables if needed. Check the services and logs in a second terminal:
+
+```sh
+docker compose ps
+docker compose logs -f api scheduler worker_default
+```
+
+Open [interactive API documentation](http://localhost:8000/docs). Compose exposes the API on port `8000`, PostgreSQL on `5432`, and Redis on `6379`; these ports must be available on your host.
+
+## Create and track tasks
+
+### Create a task
+
+Use `POST /tasks` in Swagger UI, or run:
+
+```sh
+curl -X POST http://localhost:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "demo_ok",
+    "payload": {"msg": "hello"},
+    "priority": 9,
+    "run_at": "2000-01-01T00:00:00Z",
+    "max_retries": 2
+  }'
+```
+
+The examples intentionally use a past timestamp so they become due immediately, regardless of when you try them. To schedule a task for later, replace `run_at` with your desired future timestamp.
+
+| Field | Accepted value | Default |
+| --- | --- | --- |
+| `name` | String containing 1–120 characters | Required |
+| `payload` | JSON object passed to the handler | `{}` |
+| `priority` | Integer from 1 to 10 | `5` |
+| `run_at` | ISO 8601 datetime with a timezone, such as `Z` or `+05:30` | Required |
+| `max_retries` | Integer from 0 to 20, counting retries after the first attempt | `3` |
+
+A timestamp without a timezone is rejected. Past timestamps are accepted and become eligible on the next scheduler poll.
+
+### Check task status
+
+The response includes the task's `id`. Substitute that value below:
+
+```sh
+curl http://localhost:8000/tasks/1
+```
+
+`GET /tasks/{task_id}` returns the task state, payload, retry count (`attempts`), next scheduled time (`run_at`), and last error. An unknown ID returns HTTP `404`.
+
+```text
 PENDING → ENQUEUED → STARTED → SUCCEEDED
-failures: FAILED → (retry) → SUCCEEDED
-exhausted retries: DEAD + DLQ audit event
+                        │
+                        ├─ failure, retries remain → FAILED → ENQUEUED → STARTED
+                        └─ retry budget exhausted → DEAD + DLQ audit event
+```
 
-PROJECT STRUCTURE
-distributed-task-scheduler/
-  docker-compose.yml
-  .env
-  requirements.txt
-  Dockerfile
+`attempts` counts failed or timed-out attempts, not total executions. A task with `max_retries: 1` can execute up to twice. Retries wait 2, 4, 8, 16, 32, then 60 seconds, with subsequent delays capped at 60 seconds. The scheduler may dispatch later depending on polling and service availability.
 
-  app/
-    config.py
-    db.py
-    models.py
-    schemas.py
-    celery_app.py
-    wait_for_db.py
-    tasks.py
-    main.py
+## Try failure recovery
 
-  scheduler/
-    scheduler.py
+### Retry and dead-letter audit
 
-PREREQUISITES
-
-Install:
--Docker Desktop
--Docker Compose (included in Docker Desktop) That’s it. You do not need Python installed locally.
-
-QUICK START (Run from Scratch)
-
-1) Clone and enter the project folder
-    git clone <your-repo-url>
-    cd distributed-task-scheduler
-
-2) Create .env
-Make sure you have a .env file in the project root:
-    POSTGRES_USER=postgres
-    POSTGRES_PASSWORD=postgres
-    POSTGRES_DB=tasks
-    DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/tasks
-    REDIS_URL=redis://redis:6379/0
-
-3) Start the system
-    docker compose up --build
-You should see:
-Postgres: ready to accept connections
-API: Application startup complete
-Workers: celery@... ready
-Scheduler: Scheduler started...
-
-4) Open API Docs (Swagger)
-Open in browser:
-http://localhost:8000/docs
-How to Use (Create + Track Tasks)
-Create a task (Swagger UI)
-Go to POST /tasks
-Click Try it out
-Use JSON like this:
-✅ IMPORTANT: run_at must be in the future and in ISO 8601 format.
-    Example (UTC):
-        {
-        "name": "demo_ok",
-        "payload": { "msg": "hello" },
-        "priority": 9,
-        "run_at": "2025-12-17T19:55:00Z",
-        "max_retries": 2
-        }
-Click Execute.
-You will get a response with an id.
-Check status
-Go to GET /tasks/{task_id} in Swagger:
-Enter the task id
-Execute
-Expected transitions:
-Before run_at: PENDING
-Around/after run_at: ENQUEUED → STARTED → SUCCEEDED
-
-TESTING FAULT TOLERANCE
-
-A) Retry + DLQ Test (simulate failure)
-Create a task that fails:
-{
-  "name": "demo_fail",
-  "payload": { "fail": true },
-  "priority": 5,
-  "run_at": "2025-12-17T19:56:00Z",
-  "max_retries": 1
-}
-Expected:
-It will fail, retry once, then move to:
-DEAD
-A DLQ event will be recorded in dlq_events
-
-B) Stuck Task Sweeper Test (simulate “hang”)
-Create a task that “hangs” by sleeping:
-    {
-    "name": "demo_hang",
-    "payload": { "sleep_sec": 9999 },
+```sh
+curl -X POST http://localhost:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "demo_fail",
+    "payload": {"fail": true},
     "priority": 5,
-    "run_at": "2025-12-17T19:57:00Z",
+    "run_at": "2000-01-01T00:00:00Z",
     "max_retries": 1
-    }
-Then simulate worker crash:
-    docker compose kill worker_default
-    docker compose up -d worker_default
-After STUCK_AFTER_SEC (default: 180s), scheduler will detect it as stuck and:
-retry it if retries remain otherwise mark DEAD and save a DLQ audit event
+  }'
+```
 
-How to Inspect DLQ Events (Postgres)
+The handler fails, retries once after the backoff delay, then enters `DEAD` with `attempts: 2`. The terminal state and a `max_retries_exceeded` audit event are committed together in PostgreSQL, without requiring Redis to be available for the audit write.
 
-1) Find container name
-    docker compose ps
-You’ll see something like:
-    postgres-1
+### Worker crash or timeout
 
-2) Query DLQ events
-    docker exec -it postgres-1 psql -U postgres -d tasks \
-  -c "select id, task_id, reason, created_at from dlq_events order by created_at desc limit 20;"
-You should see reasons like:
-max_retries_exceeded
-stuck_task_timeout
+Create a task that sleeps longer than the recovery timeout:
 
-VIEWING LOGS (Debugging)
-Follow scheduler and high-priority worker logs
-    docker compose logs -f scheduler worker_high
-Follow all logs
-    docker compose logs -f
-Check if all services are up
-    docker compose ps
+```sh
+curl -X POST http://localhost:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "demo_hang",
+    "payload": {"sleep_sec": 9999},
+    "priority": 5,
+    "run_at": "2000-01-01T00:00:00Z",
+    "max_retries": 1
+  }'
+```
 
+Wait until its status is `STARTED`, then simulate a worker crash:
 
-RELIABILITY AND TESTS
+```sh
+docker compose kill worker_default
+docker compose up -d worker_default
+```
 
-Workers load task handlers through the Celery application. Retry backoff starts
-when an attempt fails (2, 4, 8, ... seconds, capped at 60), rather than when the
-scheduler publishes the retry. `max_retries` counts retries after the first attempt.
-`run_at` must include a timezone (`Z` or an explicit UTC offset); task names must
-contain 1–120 characters.
+The scheduler recovers tasks that have remained `STARTED` or `ENQUEUED` for at least 180 seconds. Recovery consumes one failed attempt and schedules a retry with backoff, or marks the task `DEAD` and saves a `stuck_task_timeout` audit event when its retry budget is exhausted. The sleep hook runs again on every retry, so this example eventually becomes `DEAD`.
 
-PostgreSQL row locks let multiple schedulers claim separate batches. Dispatch
-holds the lock through publication and commit, and workers lock the row before
-checking its state. Each message includes the failure count for its attempt, so
-duplicate or delayed messages cannot claim a newer retry. The sweeper recovers
-both ENQUEUED and STARTED tasks after 180 seconds and invalidates the old attempt.
-Stale workers cannot overwrite the replacement attempt's status. Terminal failures
-save DEAD and the DLQ audit event together, even if Redis is unavailable.
+The poll interval, recovery timeout, and batch size are constants in `scheduler/scheduler.py`: `POLL_INTERVAL_SEC = 1`, `STUCK_AFTER_SEC = 180`, and `LIMIT = 200`.
 
-Execution is still at least once: timed-out work can continue outside the database.
-Real task handlers must make external side effects idempotent. A queue backlog
-longer than the timeout also consumes the retry budget. Deploy scheduler and worker
-changes together; messages from the old scheduler lack the attempt argument and
-can only claim an initial attempt (stale queued retries recover through the sweeper).
+### Inspect dead-letter events
 
-Run regression tests after installing `requirements.txt`:
+Use the Compose service name instead of guessing a container name. With the example database credentials:
 
-    python -m unittest discover -v
+```sh
+docker compose exec postgres psql -U postgres -d tasks \
+  -c 'SELECT id, task_id, reason, error, created_at FROM dlq_events ORDER BY created_at DESC LIMIT 20;'
+```
 
-The default suite uses temporary SQLite databases and mocks broker publication.
-To also verify concurrent PostgreSQL row locks, point `TEST_DATABASE_URL` at a test
-database whose user can create schemas. Each test creates and removes its own schema:
+## Reliability behavior and limits
 
-    TEST_DATABASE_URL=postgresql+psycopg2://user:password@localhost/test_db python -m unittest discover -v
+- PostgreSQL row locks prevent concurrent schedulers from dispatching the same row and concurrent workers from claiming the same attempt. Workers wait for the dispatch transaction to commit before checking task state.
+- Each dispatched message includes its attempt's failure count. Duplicate deliveries and delayed messages cannot claim a newer retry. A stale worker cannot overwrite the replacement attempt's database state.
+- A failed publication rolls back the dispatch transaction so a later scheduler poll can try again. The sweeper recovers queued messages that never start.
+- Execution is **at least once**. Recovery does not stop code that is already running, so real handlers must make external side effects idempotent. This project does not guarantee exactly-once execution.
+- A queue backlog longer than 180 seconds also consumes retry budget. Adjust the timeout and worker capacity for your workload.
+- Deploy scheduler and worker changes together. Old messages lack an attempt argument and can only claim an initial attempt; queued retries from an older scheduler recover through the sweeper.
+
+The Compose setup is intended for local development. PostgreSQL has no named volume configured; removing its container can remove its data. Keep backups or configure persistent storage before relying on it for durable deployments.
+
+## Run regression tests
+
+Use Python 3.11 or later:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -v
+```
+
+On Windows, activate the environment with `.venv\Scripts\Activate.ps1` in PowerShell.
+
+The default suite uses temporary SQLite databases and mocks broker publication. The two PostgreSQL concurrency tests are skipped unless `TEST_DATABASE_URL` is set. To run them against the Compose PostgreSQL service from your host:
+
+```sh
+TEST_DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/tasks \
+  python -m unittest discover -v
+```
+
+Each PostgreSQL test creates and removes its own schema. The database user needs permission to create schemas. GitHub Actions runs the suite with PostgreSQL 16 and Python 3.11 on pushes and pull requests.
+
+These tests cover handler registration, payload access, retry timing, request validation, duplicate deliveries, stale workers, stuck tasks, publication failures, DLQ persistence, and concurrent row locking. They do not exercise a live Redis broker or the full Compose stack.
+
+## Project structure
+
+```text
+distributed-task-scheduler/
+├── .github/workflows/tests.yml  # Regression tests with PostgreSQL
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── app/
+│   ├── celery_app.py            # Celery configuration and handler imports
+│   ├── config.py                # Database and Redis URLs
+│   ├── db.py                    # SQLAlchemy engine and sessions
+│   ├── main.py                  # FastAPI endpoints
+│   ├── models.py                # Tasks and DLQ audit records
+│   ├── schemas.py               # Request and response validation
+│   ├── tasks.py                 # Execution, retries, and terminal failures
+│   ├── timing.py                # UTC time and retry backoff
+│   └── wait_for_db.py           # Database readiness polling
+├── scheduler/
+│   └── scheduler.py            # Dispatch and timeout recovery
+└── tests/                      # Regression and concurrency tests
+```
+
+## Useful commands
+
+```sh
+# Follow all service logs
+docker compose logs -f
+
+# Follow scheduler and high-priority worker logs
+docker compose logs -f scheduler worker_high
+
+# Stop services while keeping their containers
+docker compose stop
+
+# Start existing containers again
+docker compose start
+```
