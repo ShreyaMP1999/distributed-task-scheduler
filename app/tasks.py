@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 from celery import shared_task
@@ -9,7 +9,7 @@ from app.models import Task, TaskStatus, DLQEvent
 from app.celery_app import celery
 
 def _now():
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 @shared_task(name="app.tasks.dlq_handler")
 def dlq_handler(task_id: int, reason: str, error: str | None, payload: dict):
@@ -27,6 +27,7 @@ def run_task(self, task_id: int):
         if not task:
             return {"ok": False, "error": "task not found"}
 
+        payload = dict(task.payload)
         task.status = TaskStatus.STARTED
         task.started_at = _now()
         db.commit()
@@ -34,15 +35,15 @@ def run_task(self, task_id: int):
     try:
         # --- Demo-only hooks (remove later if you want) ---
         # 1) Simulate "hung" task
-        if task.payload.get("sleep_sec"):
-            time.sleep(int(task.payload["sleep_sec"]))
+        if payload.get("sleep_sec"):
+            time.sleep(int(payload["sleep_sec"]))
 
         # 2) Simulate failure
-        if task.payload.get("fail"):
+        if payload.get("fail"):
             raise RuntimeError("Simulated failure requested by payload")
 
         # --- Put real work here ---
-        result = {"ok": True, "echo": task.payload}
+        result = {"ok": True, "echo": payload}
 
         with SessionLocal() as db:
             t2 = db.execute(select(Task).where(Task.id == task_id)).scalar_one()
